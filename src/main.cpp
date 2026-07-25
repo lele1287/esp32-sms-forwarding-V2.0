@@ -148,17 +148,14 @@ void setup() {
 }
 
 void loop() {
+  // AP模式下配置提示：仅在AP模式且配置未完成时，每3秒打印一次配置URL
   {
     static unsigned long lastUrlPrint = 0;
-    if (millis() - lastUrlPrint >= 3000) {
+    if (WifiManager::mode() == WIFI_MODE_AP_ACTIVE && !ConfigStore::isValid() && 
+        millis() - lastUrlPrint >= 3000) {
       lastUrlPrint = millis();
-      if (WifiManager::mode() == WIFI_MODE_AP_ACTIVE) {
-        LOG("MAIN", "SIM号码: %s，短信转发服务正常运行，请访问 %s 配置WiFi（设备名: %s）",
-            Sim::phoneNum().c_str(), WifiManager::deviceUrl().c_str(), WifiManager::deviceName().c_str());
-      } else {
-        LOG("MAIN", "SIM号码: %s，短信转发服务正常运行，请访问 %s 进行配置",
-            Sim::phoneNum().c_str(), WifiManager::deviceUrl().c_str());
-      }
+      LOG("MAIN", "SIM号码: %s，短信转发服务正常运行，请访问 %s 进行配置（设备名: %s）",
+          Sim::phoneNum().c_str(), WifiManager::deviceUrl().c_str(), WifiManager::deviceName().c_str());
     }
   }
 
