@@ -1,0 +1,219 @@
+name: Build & Release Firmware
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'src/**'
+      - 'data/**'
+      - 'platformio.ini'
+      - '.github/workflows/build.yml'
+      - 'VERSION'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate VERSION tag
+        id: version
+        run: |
+          if [ -f VERSION ]; then
+            PREFIX=$(cat VERSION | tr -d '[:space:]')
+          else
+            PREFIX="1"
+          fi
+          SHA_SHORT=$(git rev-parse --short=7 HEAD)
+          FULL_SHA=$(git rev-parse HEAD)
+          YYYYMMDD=$(TZ=Asia/Shanghai date +%Y%m%d)
+          HHmmss=$(TZ=Asia/Shanghai date +%H%M%S)
+          APP_BUILD_TIMESTAMP="${YYYYMMDD}T${HHmmss}"
+          VERSION_TAG="${PREFIX}-${APP_BUILD_TIMESTAMP}-${SHA_SHORT}"
+          APP_VERSION="${PREFIX}-${SHA_SHORT}"
+          TIMESTAMP=$(TZ=Asia/Shanghai date +%Y-%m-%dT%H:%M:%S+08:00)
+          echo "VERSION_TAG=${VERSION_TAG}" >> $GITHUB_ENV
+          echo "APP_VERSION=${APP_VERSION}" >> $GITHUB_ENV
+          echo "APP_BUILD_TIMESTAMP=${APP_BUILD_TIMESTAMP}" >> $GITHUB_ENV
+          echo "SHA_SHORT=${SHA_SHORT}" >> $GITHUB_ENV
+          echo "FULL_SHA=${FULL_SHA}" >> $GITHUB_ENV
+          echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
+
+      - name: Cache PlatformIO dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio/libdeps
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-
+
+      - name: Clean build environment
+        run: |
+          rm -rf .pio/build
+          rm -rf ~/.platformio/cache
+
+      - name: Install PlatformIO
+        run: |
+          pip install --upgrade pip
+          pip install platformio
+
+      - name: Install esptool
+        run: pip install "esptool>=4.8"
+
+      - name: Build firmware
+        run: pio run -e makergo_esp32c3_supermini
+
+      - name: Compress data/ for LittleFS
+        if: github.event_name != 'pull_request'
+        run: python3 script/compress_data.py
+
+      - name: Build LittleFS image
+        if: github.event_name != 'pull_request'
+        run: pio run -e makergo_esp32c3_supermini -t buildfs
+
+      - name: Restore data/ directory
+        if: github.event_name != 'pull_request'
+        run: python3 script/restore_data.py
+
+      - name: Merge firmware binaries
+        if: github.event_name != 'pull_request'
+        run: |
+          BUILD_DIR=".pio/build/makergo_esp32c3_supermini"
+          # full-{VERSION_TAG}.bin: 首次安装用（含 bootloader + 分区表，会清空 NVS）
+          # 使用 --flash_mode keep --flash_freq keep 避免覆盖 bootloader 内部已编译的
+          # flash 参数字节，防止使 ESP-IDF 附加的 SHA256 摘要失效（否则 ROM 校验失败
+          # 导致 ets_loader.c 78 崩溃并死循环重启）
+          esptool --chip esp32c3 merge_bin \
+            --flash_mode keep --flash_freq keep --flash_size 4MB \
+            -o "${BUILD_DIR}/full-${VERSION_TAG}.bin" \
+            0x0      "${BUILD_DIR}/bootloader.bin" \
+            0x8000   "${BUILD_DIR}/partitions.bin" \
+            0x10000  "${BUILD_DIR}/firmware.bin" \
+            0x3B0000 "${BUILD_DIR}/littlefs.bin"
+          # update-{VERSION_TAG}.bin: 升级用（从 0x10000 开始，跳过 NVS，保留 WiFi 等配置）
+          esptool --chip esp32c3 merge_bin \
+            --flash_mode keep --flash_freq keep --flash_size 4MB \
+            --target-offset 0x10000 \
+            -o "${BUILD_DIR}/update-${VERSION_TAG}.bin" \
+            0x10000  "${BUILD_DIR}/firmware.bin" \
+            0x3B0000 "${BUILD_DIR}/littlefs.bin"
+          # littlefs-{VERSION_TAG}.bin: 单独保存 LittleFS 镜像
+          cp "${BUILD_DIR}/littlefs.bin" "${BUILD_DIR}/littlefs-${VERSION_TAG}.bin"
+          # ota-{VERSION_TAG}.bin: 仅应用分区（firmware.bin），用于设备 OTA 在线升级
+          cp "${BUILD_DIR}/firmware.bin" "${BUILD_DIR}/ota-${VERSION_TAG}.bin"
+          # firmware-{VERSION_TAG}.elf: 调试符号文件，配合 coredump.bin 做离线分析
+          cp "${BUILD_DIR}/firmware.elf" "${BUILD_DIR}/firmware-${VERSION_TAG}.elf"
+
+      - name: Generate release notes
+        if: github.event_name != 'pull_request'
+        run: |
+          BUILD_DIR=".pio/build/makergo_esp32c3_supermini"
+          HASH_FULL=$(sha256sum "${BUILD_DIR}/full-${VERSION_TAG}.bin" | awk '{print $1}')
+          HASH_UPDATE=$(sha256sum "${BUILD_DIR}/update-${VERSION_TAG}.bin" | awk '{print $1}')
+          HASH_LITTLEFS=$(sha256sum "${BUILD_DIR}/littlefs-${VERSION_TAG}.bin" | awk '{print $1}')
+          HASH_OTA=$(sha256sum "${BUILD_DIR}/ota-${VERSION_TAG}.bin" | awk '{print $1}')
+          HASH_ELF=$(sha256sum "${BUILD_DIR}/firmware-${VERSION_TAG}.elf" | awk '{print $1}')
+          cat > release_notes.md << EOF
+          ## 固件版本: ${VERSION_TAG}
+
+          | 属性 | 值 |
+          |------|-----|
+          | Commit | ${FULL_SHA} |
+          | 构建时间 | ${TIMESTAMP} |
+          | 目标设备 | MakerGO ESP32-C3 SuperMini |
+
+          ## 文件说明
+
+          | 文件名 | 用途 | 写入偏移 |
+          |--------|------|----------|
+          | full-${VERSION_TAG}.bin | 首次安装（含 bootloader + Web UI，**会清空所有配置**） | \`0x0\` |
+          | update-${VERSION_TAG}.bin | 固件升级（**保留 WiFi 等配置**，含 Web UI） | \`0x10000\` |
+          | littlefs-${VERSION_TAG}.bin | 单独更新 Web UI 文件系统 | \`0x3B0000\` |
+          | ota-${VERSION_TAG}.bin | 设备 OTA 在线升级专用（仅应用分区） | OTA 分区 |
+          | firmware-${VERSION_TAG}.elf | 调试符号文件，配合 coredump.bin 离线分析用 | — |
+
+          ## 烧录说明
+
+          ### 方式一：图形化烧录（推荐新手，零安装）
+
+          使用 **ESPConnect** 浏览器工具，无需安装任何软件：
+
+          > 工具地址：https://thelastoutpostworkshop.github.io/ESPConnect/
+          > 浏览器要求：Chrome 或 Edge（Firefox / Safari 不支持 Web Serial API）
+          
+          **连接**：
+          1. 波特率选择 \`921600\`
+          2. 点击「连接」，在浏览器弹窗中选择 "USB JTAG/serial debug unit" 设备
+
+          **首次安装**（新设备或需要重置配置）：
+          1. 连接设备，进入「闪存工具」→「烧录固件」，烧录地址填 \`0x0\`
+          2. 上传 \`full.bin\`，点击开始烧录
+
+          **固件升级**（保留 WiFi / 配置）：
+          1. 连接设备，进入「闪存工具」→「烧录固件」，烧录地址填 \`0x10000\`
+          2. 上传 \`update.bin\`，点击开始烧录
+
+          ### 方式二：命令行烧录（esptool）
+
+          **前置条件**：
+          - Python ≥ 3.7 — 下载：https://www.python.org/downloads/
+            - Windows：安装时勾选 **Add Python to PATH**
+          - 安装 esptool：\`pip install "esptool>=4.8"\`
+            - Linux：若 \`esptool\` 不在 PATH，可改用 \`python -m esptool\`
+
+          **首次安装**（新设备或需要重置所有配置）：
+          \`\`\`bash
+          esptool --chip esp32c3 --baud 921600 write_flash 0x0 full-${VERSION_TAG}.bin
+          \`\`\`
+
+          **固件升级**（保留 WiFi 等配置，推荐日常更新）：
+          \`\`\`bash
+          esptool --chip esp32c3 --baud 921600 write_flash 0x10000 update-${VERSION_TAG}.bin
+          \`\`\`
+
+          **仅更新 Web UI**（保留固件和配置）：
+          \`\`\`bash
+          esptool --chip esp32c3 --baud 921600 write_flash 0x3B0000 littlefs-${VERSION_TAG}.bin
+          \`\`\`
+
+          ## SHA256 校验
+
+          | 文件名 | SHA256 |
+          |--------|--------|
+          | full-${VERSION_TAG}.bin | ${HASH_FULL} |
+          | update-${VERSION_TAG}.bin | ${HASH_UPDATE} |
+          | littlefs-${VERSION_TAG}.bin | ${HASH_LITTLEFS} |
+          | ota-${VERSION_TAG}.bin | ${HASH_OTA} |
+          | firmware-${VERSION_TAG}.elf | ${HASH_ELF} |
+          EOF
+
+      - name: Publish GitHub Release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION_TAG }}
+          name: ${{ env.VERSION_TAG }}
+          body_path: release_notes.md
+          make_latest: "true"
+          fail_on_unmatched_files: true
+          files: |
+            .pio/build/makergo_esp32c3_supermini/full-${{ env.VERSION_TAG }}.bin
+            .pio/build/makergo_esp32c3_supermini/update-${{ env.VERSION_TAG }}.bin
+            .pio/build/makergo_esp32c3_supermini/littlefs-${{ env.VERSION_TAG }}.bin
+            .pio/build/makergo_esp32c3_supermini/ota-${{ env.VERSION_TAG }}.bin
+            .pio/build/makergo_esp32c3_supermini/firmware-${{ env.VERSION_TAG }}.elf
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
